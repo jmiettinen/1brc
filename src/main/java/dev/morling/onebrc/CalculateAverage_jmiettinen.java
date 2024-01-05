@@ -18,6 +18,8 @@ package dev.morling.onebrc;
 import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -46,14 +48,10 @@ public class CalculateAverage_jmiettinen {
      *
      */
 
-    public static void main(String[] args) throws IOException, ExecutionException, InterruptedException {
-        long start = System.currentTimeMillis();
-        var filename = args.length == 0 ? FILE : args[0];
-        var file = new File(filename);
-
-        var resultsMap = getFileSegments(file).stream().map(segment -> {
-            var resultMap = new Tools.ByteArrayToResultMap();
-            long segmentEnd = segment.end();
+    private static Tools.ByteArrayToResultMap readSegment(Tools.FileSegment segment, String filename) {
+        var resultMap = new Tools.ByteArrayToResultMap();
+        long segmentEnd = segment.end();
+        try {
             try (var fileChannel = (FileChannel) Files.newByteChannel(Path.of(filename), StandardOpenOption.READ)) {
                 var bb = fileChannel.map(FileChannel.MapMode.READ_ONLY, segment.start(), segmentEnd - segment.start());
                 // Up to 100 characters for a city name
@@ -65,6 +63,7 @@ public class CalculateAverage_jmiettinen {
                     byte b;
                     int offset = 0;
                     int hash = 0;
+                    // TODO Read more than a byte at a time.
                     while (currentPosition != segmentEnd && (b = bb.get(currentPosition++)) != ';') {
                         buffer[offset++] = b;
                         hash = 31 * hash + b;
@@ -93,16 +92,23 @@ public class CalculateAverage_jmiettinen {
                 }
                 return resultMap;
             }
-            catch (IOException e) {
-                throw new RuntimeException(e);
-            }
-        }).parallel().flatMap(partition -> partition.getAll().stream())
-                .collect(
-                        Collectors.toMap(
-                                Tools.Entry::key,
-                                Tools.Entry::value,
-                                CalculateAverage_jmiettinen::merge,
-                                TreeMap::new));
+        }
+        catch (IOException e) {
+            throw new RuntimeException("IOException", e);
+        }
+    }
+
+    public static void main(String[] args) throws IOException, ExecutionException, InterruptedException {
+        long start = System.currentTimeMillis();
+        var filename = args.length == 0 ? FILE : args[0];
+        var file = new File(filename);
+
+        var resultsMap = getFileSegments(file)
+                .stream()
+                .map(segment -> readSegment(segment, filename))
+                .parallel()
+                .flatMap(partition -> partition.getAll().stream())
+                .collect(Collectors.toMap(Tools.Entry::key, Tools.Entry::value, CalculateAverage_jmiettinen::merge, TreeMap::new));
 
         System.out.println(resultsMap);
     }
@@ -158,20 +164,11 @@ public class CalculateAverage_jmiettinen {
 class Tools {
 
     static class Result {
-        private final int keyIndex;
-        private final int keySize;
-        private final int hashCode;
         short min, max;
         int sum;
         int count;
 
-        Result(short value, int hash, int keyIndex, int size) {
-            min = max = value;
-            sum = value;
-            count = 1;
-            hashCode = hash;
-            this.keyIndex = keyIndex;
-            this.keySize = size;
+        Result() {
         }
 
         @Override
@@ -193,14 +190,37 @@ class Tools {
     }
 
     static class ByteArrayToResultMap {
-        public static final int MAP_SIZE = 1024 * 128;
-        final Tools.Result[] slots = new Tools.Result[MAP_SIZE];
+        public static final int MAP_SIZE = 1024 * 64;
 
+        private static final int KEY_INDEX_OFFSET = 0;
+        private static final int HASH_CODE_OFFSET = KEY_INDEX_OFFSET + Integer.BYTES;
+        private static final int KEY_SIZE_OFFSET = HASH_CODE_OFFSET + Integer.BYTES;
+        private static final int SUM_OFFSET = KEY_SIZE_OFFSET + Integer.BYTES;
+        private static final int COUNT_OFFSET = SUM_OFFSET + Integer.BYTES;
+        private static final int MIN_OFFSET = COUNT_OFFSET + Integer.BYTES;
+        private static final int MAX_OFFSET = MIN_OFFSET + Short.BYTES;
+
+        private static final int ENTRY_SIZE = MAX_OFFSET + Short.BYTES;
+        final ByteBuffer buf = ByteBuffer.allocate(MAP_SIZE * ENTRY_SIZE);
         byte[] keysAsBytes = new byte[256];
 
         private int freeIndex = 0;
+        private int entries = 0;
 
-        private int addBytes(byte[] key, int offset, int size) {
+        ByteArrayToResultMap() {
+            buf.order(ByteOrder.nativeOrder());
+            buf.limit(buf.capacity());
+        }
+
+        private int getKeyIndexFrom(int baseOffset) {
+            return ~buf.getInt(KEY_INDEX_OFFSET + baseOffset);
+        }
+
+        private void setKeyIndexTo(int baseOffset, int index) {
+            buf.putInt(KEY_INDEX_OFFSET + baseOffset, ~index);
+        }
+
+        private int addKeyBytes(byte[] key, int offset, int size) {
             if (freeIndex + size >= keysAsBytes.length) {
                 var addedSize = Math.max(MAX_KEY_SIZE, keysAsBytes.length);
                 var newBytes = new byte[keysAsBytes.length + addedSize];
@@ -214,35 +234,63 @@ class Tools {
         }
 
         public void putOrMerge(byte[] key, int offset, int size, short temp, int hash) {
-            int slot = hash & (slots.length - 1);
-            var slotValue = slots[slot];
-            // Linear probe for open slot
-            while (slotValue != null
-                    && (slotValue.hashCode != hash || slotValue.keySize != size
-                            || !Arrays.equals(keysAsBytes, slotValue.keyIndex, slotValue.keyIndex + size, key, offset, offset + size))) {
-                slot = (slot + 1) & (slots.length - 1);
-                slotValue = slots[slot];
+            int indexUnscaled = hash & (MAP_SIZE - 1);
+            int index = ENTRY_SIZE * indexUnscaled;
+            while (getKeyIndexFrom(index) >= 0) {
+                var slotKeyIndex = getKeyIndexFrom(index);
+                var slotHash = buf.getInt(index + HASH_CODE_OFFSET);
+                var slotKeySize = buf.getInt(index + KEY_SIZE_OFFSET);
+                if (slotHash != hash || slotKeySize != size
+                        || !Arrays.equals(keysAsBytes, slotKeyIndex, slotKeyIndex + size, key, offset, offset + size)) {
+                    index += ENTRY_SIZE;
+                    if (index >= keysAsBytes.length) {
+                        index = 0;
+                    }
+                }
+                else {
+                    break;
+                }
             }
-            Tools.Result value = slotValue;
-            if (value == null) {
-                var keyIndex = addBytes(key, offset, size);
-                slots[slot] = new Tools.Result(temp, hash, keyIndex, size);
+            if (getKeyIndexFrom(index) >= 0) {
+                buf.putInt(index + SUM_OFFSET, buf.getInt(index + SUM_OFFSET) + temp);
+                buf.putInt(index + COUNT_OFFSET, buf.getInt(index + COUNT_OFFSET) + 1);
+                buf.putShort(index + MIN_OFFSET, (short) Math.min(buf.getShort(index + MIN_OFFSET), temp));
+                buf.putShort(index + MAX_OFFSET, (short) Math.max(buf.getShort(index + MAX_OFFSET), temp));
             }
             else {
-                value.min = (short) Math.min(value.min, temp);
-                value.max = (short) Math.max(value.max, temp);
-                value.sum += temp;
-                value.count += 1;
+                var keyIndex = addKeyBytes(key, offset, size);
+                setKeyIndexTo(index, keyIndex);
+                buf.putInt(index + KEY_SIZE_OFFSET, size);
+                buf.putInt(index + HASH_CODE_OFFSET, hash);
+                buf.putInt(index + SUM_OFFSET, temp);
+                buf.putInt(index + COUNT_OFFSET, 1);
+                buf.putShort(index + MIN_OFFSET, temp);
+                buf.putShort(index + MAX_OFFSET, temp);
+                entries++;
             }
         }
 
         // Get all pairs
         public List<Entry> getAll() {
-            List<Tools.Entry> result = new ArrayList<>(slots.length);
-            for (Result slotValue : slots) {
-                if (slotValue != null) {
-                    var keyAsString = new String(keysAsBytes, slotValue.keyIndex, slotValue.keySize);
-                    result.add(new Entry(keyAsString, slotValue));
+            List<Tools.Entry> result = new ArrayList<>();
+            for (int index = 0; index < buf.capacity(); index += ENTRY_SIZE) {
+                var keyIndex = getKeyIndexFrom(index);
+                if (keyIndex >= 0) {
+                    var keySize = buf.getInt(index + KEY_SIZE_OFFSET);
+
+                    var keyAsString = new String(keysAsBytes, keyIndex, keySize);
+
+                    var sum = buf.getInt(index + SUM_OFFSET);
+                    var count = buf.getInt(index + COUNT_OFFSET);
+                    var min = buf.getShort(index + MIN_OFFSET);
+                    var max = buf.getShort(index + MAX_OFFSET);
+                    var materializedEntry = new Tools.Result();
+                    materializedEntry.max = max;
+                    materializedEntry.min = min;
+                    materializedEntry.sum = sum;
+                    materializedEntry.count = count;
+
+                    result.add(new Entry(keyAsString, materializedEntry));
                 }
             }
             return result;
