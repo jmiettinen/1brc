@@ -22,14 +22,20 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.ExecutionException;
 import java.util.stream.Collectors;
+import java.util.TreeMap;
+
+import static dev.morling.onebrc.CalculateAverage_jmiettinen.MAX_KEY_SIZE;
 
 public class CalculateAverage_jmiettinen {
     private static final String FILE = "./measurements.txt";
 
-    private static final int MIN_SEGMENT_SIZE = 1024 * 1024;
+    private static final int MIN_SEGMENT_SIZE = 64 * 1024 * 1024;
+    static final int MAX_KEY_SIZE = 100;
 
     /*
      * My results on this computer:
@@ -93,7 +99,7 @@ public class CalculateAverage_jmiettinen {
         }).parallel().flatMap(partition -> partition.getAll().stream())
                 .collect(
                         Collectors.toMap(
-                                e -> new String(e.key()),
+                                Tools.Entry::key,
                                 Tools.Entry::value,
                                 CalculateAverage_jmiettinen::merge,
                                 TreeMap::new));
@@ -128,7 +134,7 @@ public class CalculateAverage_jmiettinen {
         return merge(v, value.min, value.max, value.sum, value.count);
     }
 
-    private static Tools.Result merge(Tools.Result v, short min, short max, int sum, long count) {
+    private static Tools.Result merge(Tools.Result v, short min, short max, int sum, int count) {
         v.min = (short) Math.min(v.min, min);
         v.max = (short) Math.max(v.max, max);
         v.sum += sum;
@@ -152,14 +158,20 @@ public class CalculateAverage_jmiettinen {
 class Tools {
 
     static class Result {
+        private final int keyIndex;
+        private final int keySize;
+        private final int hashCode;
         short min, max;
         int sum;
         int count;
 
-        Result(short value) {
+        Result(short value, int hash, int keyIndex, int size) {
             min = max = value;
             sum = value;
             count = 1;
+            hashCode = hash;
+            this.keyIndex = keyIndex;
+            this.keySize = size;
         }
 
         @Override
@@ -174,7 +186,7 @@ class Tools {
 
     }
 
-    record Entry(byte[] key, Tools.Result value) {
+    record Entry(String key, Tools.Result value) {
     }
 
     record FileSegment(long start, long end) {
@@ -184,24 +196,37 @@ class Tools {
         public static final int MAP_SIZE = 1024 * 128;
         final Tools.Result[] slots = new Tools.Result[MAP_SIZE];
 
-        final int[] hashCodes = new int[MAP_SIZE];
-        final byte[][] keys = new byte[MAP_SIZE][];
+        byte[] keysAsBytes = new byte[256];
+
+        private int freeIndex = 0;
+
+        private int addBytes(byte[] key, int offset, int size) {
+            if (freeIndex + size >= keysAsBytes.length) {
+                var addedSize = Math.max(MAX_KEY_SIZE, keysAsBytes.length);
+                var newBytes = new byte[keysAsBytes.length + addedSize];
+                System.arraycopy(keysAsBytes, 0, newBytes, 0, freeIndex);
+                keysAsBytes = newBytes;
+            }
+            var startIndex = freeIndex;
+            System.arraycopy(key, offset, keysAsBytes, freeIndex, size);
+            freeIndex += size;
+            return startIndex;
+        }
 
         public void putOrMerge(byte[] key, int offset, int size, short temp, int hash) {
             int slot = hash & (slots.length - 1);
             var slotValue = slots[slot];
             // Linear probe for open slot
-            while (slotValue != null && (hashCodes[slot] != hash || keys[slot].length != size || !Arrays.equals(keys[slot], 0, size, key, offset, size))) {
+            while (slotValue != null
+                    && (slotValue.hashCode != hash || slotValue.keySize != size
+                            || !Arrays.equals(keysAsBytes, slotValue.keyIndex, slotValue.keyIndex + size, key, offset, offset + size))) {
                 slot = (slot + 1) & (slots.length - 1);
                 slotValue = slots[slot];
             }
             Tools.Result value = slotValue;
             if (value == null) {
-                slots[slot] = new Tools.Result(temp);
-                byte[] bytes = new byte[size];
-                System.arraycopy(key, offset, bytes, 0, size);
-                keys[slot] = bytes;
-                hashCodes[slot] = hash;
+                var keyIndex = addBytes(key, offset, size);
+                slots[slot] = new Tools.Result(temp, hash, keyIndex, size);
             }
             else {
                 value.min = (short) Math.min(value.min, temp);
@@ -212,12 +237,12 @@ class Tools {
         }
 
         // Get all pairs
-        public List<Tools.Entry> getAll() {
+        public List<Entry> getAll() {
             List<Tools.Entry> result = new ArrayList<>(slots.length);
-            for (int i = 0; i < slots.length; i++) {
-                Tools.Result slotValue = slots[i];
+            for (Result slotValue : slots) {
                 if (slotValue != null) {
-                    result.add(new Tools.Entry(keys[i], slotValue));
+                    var keyAsString = new String(keysAsBytes, slotValue.keyIndex, slotValue.keySize);
+                    result.add(new Entry(keyAsString, slotValue));
                 }
             }
             return result;
