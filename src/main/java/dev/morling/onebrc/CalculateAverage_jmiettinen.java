@@ -32,6 +32,7 @@ import java.util.stream.Collectors;
 import java.util.TreeMap;
 
 import static dev.morling.onebrc.CalculateAverage_jmiettinen.MAX_KEY_SIZE;
+import static dev.morling.onebrc.Tools.FlyweightResult.ENTRY_SIZE;
 
 public class CalculateAverage_jmiettinen {
     private static final String FILE = "./measurements.txt";
@@ -189,35 +190,138 @@ class Tools {
     record FileSegment(long start, long end) {
     }
 
+    static class FlyweightResult {
+
+        static final int KEY_INDEX_OFFSET = 0;
+        static final int HASH_CODE_OFFSET = KEY_INDEX_OFFSET + Integer.BYTES;
+        static final int KEY_SIZE_OFFSET = HASH_CODE_OFFSET + Integer.BYTES;
+        static final int SUM_OFFSET = KEY_SIZE_OFFSET + Integer.BYTES;
+        static final int COUNT_OFFSET = SUM_OFFSET + Integer.BYTES;
+        static final int MIN_OFFSET = COUNT_OFFSET + Integer.BYTES;
+        static final int MAX_OFFSET = MIN_OFFSET + Short.BYTES;
+
+        static final int ENTRY_SIZE = MAX_OFFSET + Short.BYTES;
+
+        private final ByteBuffer buf;
+        private final byte[] bytes;
+        int offset;
+
+        FlyweightResult(byte[] buffer, int offset) {
+            this.offset = offset;
+            this.buf = ByteBuffer.wrap(buffer);
+            this.bytes = buffer;
+            buf.order(ByteOrder.nativeOrder());
+            buf.limit(buf.capacity());
+        }
+
+        public boolean isSet() {
+            return getKeyIndex() >= 0;
+        }
+
+        public void setIndex(int newIndex) {
+            offset = ENTRY_SIZE * newIndex;
+        }
+
+        private int getRelativeInt(int valueOffset) {
+            return buf.getInt(offset + valueOffset);
+        }
+
+        private void setRelativeInt(int valueOffset, int value) {
+            buf.putInt(offset + valueOffset, value);
+        }
+
+        private void setRelativeShort(int valueOffset, short value) {
+            buf.putShort(offset + valueOffset, value);
+        }
+
+        private short getRelativeShort(int valueOffset) {
+            return buf.getShort(offset + valueOffset);
+        }
+
+        private int getKeyIndex() {
+            return ~getRelativeInt(KEY_INDEX_OFFSET);
+        }
+
+        private void setKeyIndex(int index) {
+            setRelativeInt(KEY_INDEX_OFFSET, ~index);
+        }
+
+        private void setKeySize(int size) {
+            setRelativeInt(KEY_SIZE_OFFSET, size);
+        }
+
+        private int getKeySize() {
+            return getRelativeInt(KEY_SIZE_OFFSET);
+        }
+
+        private void setHash(int hash) {
+            setRelativeInt(HASH_CODE_OFFSET, hash);
+        }
+
+        private int getHash() {
+            return getRelativeInt(HASH_CODE_OFFSET);
+        }
+
+        private void setSum(int sum) {
+            setRelativeInt(SUM_OFFSET, sum);
+        }
+
+        private int getSum() {
+            return getRelativeInt(SUM_OFFSET);
+        }
+
+        private void setCount(int count) {
+            setRelativeInt(COUNT_OFFSET, count);
+        }
+
+        private int getCount() {
+            return getRelativeInt(COUNT_OFFSET);
+        }
+
+        private void setMin(short min) {
+            setRelativeShort(MIN_OFFSET, min);
+        }
+
+        private short getMin() {
+            return getRelativeShort(MIN_OFFSET);
+        }
+
+        private void setMax(short max) {
+            setRelativeShort(MAX_OFFSET, max);
+        }
+
+        private short getMax() {
+            return getRelativeShort(MAX_OFFSET);
+        }
+
+        public String toString() {
+            return String.format("""
+                    key_index: %d
+                    key_size: %d
+                    hash: %d
+                    sum: %d
+                    count: %d
+                    min: %d
+                    max: %d
+                    """,
+                    getKeyIndex(), getKeySize(), getHash(), getSum(), getCount(), getMin(), getMax());
+        }
+
+    }
+
     static class ByteArrayToResultMap {
         public static final int MAP_SIZE = 1024 * 64;
 
-        private static final int KEY_INDEX_OFFSET = 0;
-        private static final int HASH_CODE_OFFSET = KEY_INDEX_OFFSET + Integer.BYTES;
-        private static final int KEY_SIZE_OFFSET = HASH_CODE_OFFSET + Integer.BYTES;
-        private static final int SUM_OFFSET = KEY_SIZE_OFFSET + Integer.BYTES;
-        private static final int COUNT_OFFSET = SUM_OFFSET + Integer.BYTES;
-        private static final int MIN_OFFSET = COUNT_OFFSET + Integer.BYTES;
-        private static final int MAX_OFFSET = MIN_OFFSET + Short.BYTES;
-
-        private static final int ENTRY_SIZE = MAX_OFFSET + Short.BYTES;
-        final ByteBuffer buf = ByteBuffer.allocate(MAP_SIZE * ENTRY_SIZE);
+        final byte[] valuesAsBytes = new byte[MAP_SIZE * ENTRY_SIZE];
         byte[] keysAsBytes = new byte[256];
 
         private int freeIndex = 0;
         private int entries = 0;
 
+        private final FlyweightResult view;
+
         ByteArrayToResultMap() {
-            buf.order(ByteOrder.nativeOrder());
-            buf.limit(buf.capacity());
-        }
-
-        private int getKeyIndexFrom(int baseOffset) {
-            return ~buf.getInt(KEY_INDEX_OFFSET + baseOffset);
-        }
-
-        private void setKeyIndexTo(int baseOffset, int index) {
-            buf.putInt(KEY_INDEX_OFFSET + baseOffset, ~index);
+            view = new FlyweightResult(valuesAsBytes, 0);
         }
 
         private int addKeyBytes(byte[] key, int offset, int size) {
@@ -235,37 +339,37 @@ class Tools {
 
         public void putOrMerge(byte[] key, int offset, int size, short temp, int hash) {
             int indexUnscaled = hash & (MAP_SIZE - 1);
-            int index = ENTRY_SIZE * indexUnscaled;
-            while (getKeyIndexFrom(index) >= 0) {
-                var slotKeyIndex = getKeyIndexFrom(index);
-                var slotHash = buf.getInt(index + HASH_CODE_OFFSET);
-                var slotKeySize = buf.getInt(index + KEY_SIZE_OFFSET);
+            view.setIndex(indexUnscaled);
+            while (view.isSet()) {
+                var slotKeyIndex = view.getKeyIndex();
+                var slotHash = view.getHash();
+                var slotKeySize = view.getKeySize();
                 if (slotHash != hash || slotKeySize != size
                         || !Arrays.equals(keysAsBytes, slotKeyIndex, slotKeyIndex + size, key, offset, offset + size)) {
-                    index += ENTRY_SIZE;
-                    if (index >= keysAsBytes.length) {
-                        index = 0;
+                    view.offset += ENTRY_SIZE;
+                    if (view.offset >= keysAsBytes.length) {
+                        view.offset = 0;
                     }
                 }
                 else {
                     break;
                 }
             }
-            if (getKeyIndexFrom(index) >= 0) {
-                buf.putInt(index + SUM_OFFSET, buf.getInt(index + SUM_OFFSET) + temp);
-                buf.putInt(index + COUNT_OFFSET, buf.getInt(index + COUNT_OFFSET) + 1);
-                buf.putShort(index + MIN_OFFSET, (short) Math.min(buf.getShort(index + MIN_OFFSET), temp));
-                buf.putShort(index + MAX_OFFSET, (short) Math.max(buf.getShort(index + MAX_OFFSET), temp));
+            if (view.isSet()) {
+                view.setSum(view.getSum() + temp);
+                view.setCount(view.getCount() + 1);
+                view.setMin((short) Math.min(view.getMin(), temp));
+                view.setMax((short) Math.max(view.getMax(), temp));
             }
             else {
                 var keyIndex = addKeyBytes(key, offset, size);
-                setKeyIndexTo(index, keyIndex);
-                buf.putInt(index + KEY_SIZE_OFFSET, size);
-                buf.putInt(index + HASH_CODE_OFFSET, hash);
-                buf.putInt(index + SUM_OFFSET, temp);
-                buf.putInt(index + COUNT_OFFSET, 1);
-                buf.putShort(index + MIN_OFFSET, temp);
-                buf.putShort(index + MAX_OFFSET, temp);
+                view.setKeyIndex(keyIndex);
+                view.setKeySize(size);
+                view.setHash(hash);
+                view.setSum(temp);
+                view.setCount(1);
+                view.setMin(temp);
+                view.setMax(temp);
                 entries++;
             }
         }
@@ -273,22 +377,15 @@ class Tools {
         // Get all pairs
         public List<Entry> getAll() {
             List<Tools.Entry> result = new ArrayList<>();
-            for (int index = 0; index < buf.capacity(); index += ENTRY_SIZE) {
-                var keyIndex = getKeyIndexFrom(index);
-                if (keyIndex >= 0) {
-                    var keySize = buf.getInt(index + KEY_SIZE_OFFSET);
-
-                    var keyAsString = new String(keysAsBytes, keyIndex, keySize);
-
-                    var sum = buf.getInt(index + SUM_OFFSET);
-                    var count = buf.getInt(index + COUNT_OFFSET);
-                    var min = buf.getShort(index + MIN_OFFSET);
-                    var max = buf.getShort(index + MAX_OFFSET);
+            for (int i = 0; i < MAP_SIZE; i++) {
+                view.setIndex(i);
+                if (view.isSet()) {
+                    var keyAsString = new String(keysAsBytes, view.getKeyIndex(), view.getKeySize());
                     var materializedEntry = new Tools.Result();
-                    materializedEntry.max = max;
-                    materializedEntry.min = min;
-                    materializedEntry.sum = sum;
-                    materializedEntry.count = count;
+                    materializedEntry.max = view.getMax();
+                    materializedEntry.min = view.getMin();
+                    materializedEntry.sum = view.getSum();
+                    materializedEntry.count = view.getCount();
 
                     result.add(new Entry(keyAsString, materializedEntry));
                 }
