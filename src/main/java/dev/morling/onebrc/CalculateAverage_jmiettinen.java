@@ -15,9 +15,15 @@
  */
 package dev.morling.onebrc;
 
+import sun.misc.Unsafe;
+
 import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
+import java.io.UncheckedIOException;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
@@ -38,6 +44,8 @@ public class CalculateAverage_jmiettinen {
     private static final String FILE = "./measurements.txt";
 
     private static final int MIN_SEGMENT_SIZE = 64 * 1024 * 1024;
+
+    private static final int PER_SEGMENT_BUFFER_SIZE = 256 * 1024;
     static final int MAX_KEY_SIZE = 100;
 
     /*
@@ -49,53 +57,79 @@ public class CalculateAverage_jmiettinen {
      *
      */
 
+    private static int hashStep(int current, byte value) {
+        return current * 31 + value;
+    }
+
+    private static int finalizeHash(int current) {
+        return current;
+    }
+
+    private static void readInto(Tools.ByteArrayToResultMap resultMap, ByteBuffer bb, byte[] buffer) {
+        byte[] nameBuffer = new byte[100];
+        int limit = bb.limit();
+
+        boolean readingDigit = false;
+        int temp = 0;
+        int offset = 0;
+        int hash = 0;
+        int sign = 1;
+
+        do {
+            int left = limit - bb.position();
+            int toRead = Math.min(buffer.length, left);
+            bb.get(buffer, 0, toRead);
+            for (int i = 0; i < toRead; i++) {
+                byte b = buffer[i];
+                if (b == ';') {
+                    readingDigit = true;
+                }
+                else if (b == '\r') {
+                    // Just skip
+                }
+                else if (b == '\n') {
+                    int finalNumber = sign * temp;
+                    hash = finalizeHash(hash);
+                    resultMap.putOrMerge(nameBuffer, 0, offset, (short) finalNumber, hash);
+                    // Reset all state variables for next line;
+                    offset = hash = temp = 0;
+                    readingDigit = false;
+                    sign = 1;
+                }
+                else if (!readingDigit) {
+                    // We're reading a name
+                    nameBuffer[offset++] = b;
+                    hash = hashStep(hash, b);
+                }
+                else {
+                    // We're reading a digit
+                    // This assumes well-formed input. Things like 1-2-3 will be read by it (incorrectly).
+                    if (b == '-') {
+                        sign = -1;
+                    }
+                    else if (b != '.') {
+                        // We have a digit
+                        temp = temp * 10 + (b - '0');
+                    }
+                }
+            }
+        } while (bb.position() < limit);
+    }
+
     private static Tools.ByteArrayToResultMap readSegment(Tools.FileSegment segment, String filename) {
         var resultMap = new Tools.ByteArrayToResultMap();
         long segmentEnd = segment.end();
         try {
             try (var fileChannel = (FileChannel) Files.newByteChannel(Path.of(filename), StandardOpenOption.READ)) {
                 var bb = fileChannel.map(FileChannel.MapMode.READ_ONLY, segment.start(), segmentEnd - segment.start());
-                // Up to 100 characters for a city name
-                var buffer = new byte[100];
-                int startLine;
-                int limit = bb.limit();
-                while ((startLine = bb.position()) < limit) {
-                    int currentPosition = startLine;
-                    byte b;
-                    int offset = 0;
-                    int hash = 0;
-                    // TODO Read more than a byte at a time.
-                    while (currentPosition != segmentEnd && (b = bb.get(currentPosition++)) != ';') {
-                        buffer[offset++] = b;
-                        hash = 31 * hash + b;
-                    }
-                    int temp;
-                    int negative = 1;
-                    // Inspired by @yemreinci to unroll this even further
-                    if (bb.get(currentPosition) == '-') {
-                        negative = -1;
-                        currentPosition++;
-                    }
-                    if (bb.get(currentPosition + 1) == '.') {
-                        temp = negative * ((bb.get(currentPosition) - '0') * 10 + (bb.get(currentPosition + 2) - '0'));
-                        currentPosition += 3;
-                    }
-                    else {
-                        temp = negative * ((bb.get(currentPosition) - '0') * 100 + ((bb.get(currentPosition + 1) - '0') * 10 + (bb.get(currentPosition + 3) - '0')));
-                        currentPosition += 4;
-                    }
-                    if (bb.get(currentPosition) == '\r') {
-                        currentPosition++;
-                    }
-                    currentPosition++;
-                    resultMap.putOrMerge(buffer, 0, offset, (short) temp, hash);
-                    bb.position(currentPosition);
-                }
+
+                byte[] buffer = new byte[PER_SEGMENT_BUFFER_SIZE];
+                readInto(resultMap, bb, buffer);
                 return resultMap;
             }
         }
         catch (IOException e) {
-            throw new RuntimeException("IOException", e);
+            throw new UncheckedIOException(e);
         }
     }
 
@@ -192,6 +226,19 @@ class Tools {
 
     static class FlyweightResult {
 
+        private static final Unsafe unsafe;
+
+        static {
+            try {
+                Field unsafeField = Unsafe.class.getDeclaredField("theUnsafe");
+                unsafeField.setAccessible(true);
+                unsafe = (Unsafe) unsafeField.get(null);
+            }
+            catch (Exception e) {
+                throw new RuntimeException("Unable to access Unsafe", e);
+            }
+        }
+
         static final int KEY_INDEX_OFFSET = 0;
         static final int HASH_CODE_OFFSET = KEY_INDEX_OFFSET + Integer.BYTES;
         static final int KEY_SIZE_OFFSET = HASH_CODE_OFFSET + Integer.BYTES;
@@ -202,9 +249,13 @@ class Tools {
 
         static final int ENTRY_SIZE = MAX_OFFSET + Short.BYTES;
 
+        static final int ARRAY_OFFSET = unsafe.arrayBaseOffset(byte[].class);
+
+        // private final MemorySegment memory;
         private final ByteBuffer buf;
         private final byte[] bytes;
         int offset;
+        private final ValueLayout.OfByte layout = ValueLayout.JAVA_BYTE;
 
         FlyweightResult(byte[] buffer, int offset) {
             this.offset = offset;
@@ -212,10 +263,12 @@ class Tools {
             this.bytes = buffer;
             buf.order(ByteOrder.nativeOrder());
             buf.limit(buf.capacity());
+
+            // memory = MemorySegment.ofArray(buffer);
         }
 
         public boolean isSet() {
-            return getKeyIndex() >= 0;
+            return getRelativeInt(KEY_INDEX_OFFSET) != 0;
         }
 
         public void setIndex(int newIndex) {
@@ -223,19 +276,25 @@ class Tools {
         }
 
         private int getRelativeInt(int valueOffset) {
-            return buf.getInt(offset + valueOffset);
+            return unsafe.getInt(bytes, ARRAY_OFFSET + offset + valueOffset);
+            // return memory.get(layout, offset + valueOffset);
+            // return buf.getInt(offset + valueOffset);
         }
 
         private void setRelativeInt(int valueOffset, int value) {
-            buf.putInt(offset + valueOffset, value);
+            // memory.set(layout, value);
+            // buf.putInt(offset + valueOffset, value);
+            unsafe.putInt(bytes, ARRAY_OFFSET + offset + valueOffset, value);
         }
 
         private void setRelativeShort(int valueOffset, short value) {
-            buf.putShort(offset + valueOffset, value);
+            unsafe.putShort(bytes, ARRAY_OFFSET + offset + valueOffset, value);
+            // buf.putShort(offset + valueOffset, value);
         }
 
         private short getRelativeShort(int valueOffset) {
-            return buf.getShort(offset + valueOffset);
+            return unsafe.getShort(bytes, ARRAY_OFFSET + offset + valueOffset);
+            // return buf.getShort(offset + valueOffset);
         }
 
         private int getKeyIndex() {
@@ -310,7 +369,7 @@ class Tools {
     }
 
     static class ByteArrayToResultMap {
-        public static final int MAP_SIZE = 1024 * 64;
+        public static final int MAP_SIZE = 1024;
 
         final byte[] valuesAsBytes = new byte[MAP_SIZE * ENTRY_SIZE];
         byte[] keysAsBytes = new byte[256];
@@ -340,19 +399,21 @@ class Tools {
         public void putOrMerge(byte[] key, int offset, int size, short temp, int hash) {
             int indexUnscaled = hash & (MAP_SIZE - 1);
             view.setIndex(indexUnscaled);
+
             while (view.isSet()) {
-                var slotKeyIndex = view.getKeyIndex();
-                var slotHash = view.getHash();
-                var slotKeySize = view.getKeySize();
-                if (slotHash != hash || slotKeySize != size
-                        || !Arrays.equals(keysAsBytes, slotKeyIndex, slotKeyIndex + size, key, offset, offset + size)) {
-                    view.offset += ENTRY_SIZE;
-                    if (view.offset >= keysAsBytes.length) {
-                        view.offset = 0;
+                if (view.getHash() == hash) {
+                    var slotKeySize = view.getKeySize();
+                    if (slotKeySize == size) {
+                        var slotKeyIndex = view.getKeyIndex();
+                        if (Arrays.equals(keysAsBytes, slotKeyIndex, slotKeyIndex + size, key, offset, offset + size)) {
+                            // It's a match
+                            break;
+                        }
                     }
                 }
-                else {
-                    break;
+                view.offset += ENTRY_SIZE;
+                if (view.offset >= keysAsBytes.length) {
+                    view.offset = 0;
                 }
             }
             if (view.isSet()) {
